@@ -1,0 +1,99 @@
+# Shared APIM policies. Azure APIOps Publisher v7.0.2 only.
+# Does not change existing API repositories or create an APIM service.
+trigger: none
+# Azure Repos pull-request validation is configured through branch policies.
+
+parameters:
+- name: deployToDev
+  displayName: Deploy shared policies to DEV (requires approvals)
+  type: boolean
+  default: false
+- name: devServiceConnection
+  displayName: Existing DEV Azure Resource Manager service connection
+  type: string
+  default: 'REPLACE_WITH_DEV_ARM_SERVICE_CONNECTION'
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: Build
+  displayName: Validate XML and package APIOps artifacts
+  jobs:
+  - job: Package
+    displayName: Package isolated fragment and global policy artifacts
+    steps:
+    - checkout: self
+      clean: true
+    - pwsh: |
+        & "$(Build.SourcesDirectory)/scripts/build-artifacts.ps1" `
+          -RepoRoot "$(Build.SourcesDirectory)" `
+          -OutputRoot "$(Build.ArtifactStagingDirectory)/shared-apim-artifacts"
+      displayName: XML validation and XML-to-JSON packaging
+    - publish: '$(Build.ArtifactStagingDirectory)/shared-apim-artifacts'
+      artifact: shared-apim-artifacts
+      displayName: Publish immutable APIOps artifacts
+
+# When deployToDev=false these stages are not included at all.
+- ${{ if eq(parameters.deployToDev, true) }}:
+  - stage: DeployFragments
+    displayName: Create or update three policy fragments
+    dependsOn: Build
+    condition: succeeded()
+    variables:
+    - group: 'REPLACE_WITH_DEV_VARIABLE_GROUP'
+    jobs:
+    - deployment: PublishFragments
+      displayName: APIOps Publisher v7.0.2 - fragments
+      environment: apim-dev-shared
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self
+            - download: current
+              artifact: shared-apim-artifacts
+            - task: AzureCLI@2
+              displayName: Publish and verify fragments
+              inputs:
+                azureSubscription: ${{ parameters.devServiceConnection }}
+                scriptType: pscore
+                scriptLocation: inlineScript
+                inlineScript: |
+                  & "$(Build.SourcesDirectory)/scripts/deploy-shared-policies.ps1" `
+                    -Stage Fragments `
+                    -ArtifactsRoot "$(Pipeline.Workspace)/shared-apim-artifacts" `
+                    -TargetSubscriptionId "$(targetSubscriptionId)" `
+                    -TargetResourceGroup "$(targetResourceGroup)" `
+                    -TargetApimName "$(targetApimName)"
+
+  - stage: DeployGlobalPolicy
+    displayName: Create or update global policy after fragment verification
+    dependsOn: DeployFragments
+    condition: succeeded()
+    variables:
+    - group: 'REPLACE_WITH_DEV_VARIABLE_GROUP'
+    jobs:
+    - deployment: PublishGlobal
+      displayName: APIOps Publisher v7.0.2 - global policy
+      environment: apim-dev-shared
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self
+            - download: current
+              artifact: shared-apim-artifacts
+            - task: AzureCLI@2
+              displayName: Publish and verify global policy
+              inputs:
+                azureSubscription: ${{ parameters.devServiceConnection }}
+                scriptType: pscore
+                scriptLocation: inlineScript
+                inlineScript: |
+                  & "$(Build.SourcesDirectory)/scripts/deploy-shared-policies.ps1" `
+                    -Stage Global `
+                    -ArtifactsRoot "$(Pipeline.Workspace)/shared-apim-artifacts" `
+                    -TargetSubscriptionId "$(targetSubscriptionId)" `
+                    -TargetResourceGroup "$(targetResourceGroup)" `
+                    -TargetApimName "$(targetApimName)"
