@@ -30,9 +30,12 @@ stages:
           -RepoRoot "$(Build.SourcesDirectory)" `
           -OutputRoot "$(Build.ArtifactStagingDirectory)/shared-apim-artifacts"
       displayName: XML validation and XML-to-JSON packaging
-    - publish: '$(Build.ArtifactStagingDirectory)/shared-apim-artifacts'
-      artifact: shared-apim-artifacts
-      displayName: Publish immutable APIOps artifacts
+    - task: PublishBuildArtifacts@1
+      displayName: Publish APIOps Build Artifacts (existing pipeline convention)
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/shared-apim-artifacts'
+        ArtifactName: 'shared-apim-artifacts'
+        publishLocation: 'Container'
 
 # When deployToDev=false these stages are not included at all.
 - ${{ if eq(parameters.deployToDev, true) }}:
@@ -51,8 +54,14 @@ stages:
           deploy:
             steps:
             - checkout: self
-            - download: current
-              artifact: shared-apim-artifacts
+            - download: none
+            - task: DownloadBuildArtifacts@1
+              displayName: Download APIOps Build Artifacts
+              inputs:
+                buildType: 'current'
+                downloadType: 'single'
+                artifactName: 'shared-apim-artifacts'
+                downloadPath: '$(Pipeline.Workspace)'
             - task: AzureCLI@2
               displayName: Publish and verify fragments
               inputs:
@@ -82,8 +91,14 @@ stages:
           deploy:
             steps:
             - checkout: self
-            - download: current
-              artifact: shared-apim-artifacts
+            - download: none
+            - task: DownloadBuildArtifacts@1
+              displayName: Download APIOps Build Artifacts
+              inputs:
+                buildType: 'current'
+                downloadType: 'single'
+                artifactName: 'shared-apim-artifacts'
+                downloadPath: '$(Pipeline.Workspace)'
             - task: AzureCLI@2
               displayName: Publish and verify global policy
               inputs:
