@@ -1,0 +1,124 @@
+# APIM shared policies: manual release of a SELECTED Build run to ONE environment.
+# Keep scripts/deploy-shared-policies.ps1 unchanged (APIOps Publisher v7.0.2).
+# Replace the Build pipeline display name, DEV variable group, and DEV service
+# connection with the EXACT values from your working Azure DevOps pipelines.
+# UAT/PROD entries are future placeholders; configure before selecting those.
+
+name: 'release-$(Date:yyyyMMdd).$(Rev:r)'
+
+trigger: none
+pr: none
+
+parameters:
+- name: targetEnvironment
+  displayName: 'Deployment environment'
+  type: string
+  default: DEV
+  values:
+  - DEV
+  - UAT
+  - PROD
+
+resources:
+  pipelines:
+  - pipeline: sharedPoliciesBuild
+    source: 'APIM Shared Policies - Build'  # Exact Azure DevOps Build pipeline DISPLAY name
+    trigger: none                          # Manual release only for now
+
+# The selected environment determines its existing Azure DevOps variable group,
+# Azure Resource Manager service connection and Azure DevOps Environment.
+# Variable groups must contain targetSubscriptionId, targetResourceGroup,
+# and targetApimName, as in your working Dev pipeline.
+variables:
+- ${{ if eq(parameters.targetEnvironment, 'DEV') }}:
+  - group: 'REPLACE_WITH_EXISTING_DEV_VARIABLE_GROUP'
+  - name: apimServiceConnection
+    value: 'REPLACE_WITH_EXISTING_DEV_SERVICE_CONNECTION'
+  - name: apimDeploymentEnvironment
+    value: 'apim-shared-policies'  # Your existing Dev Environment
+
+- ${{ if eq(parameters.targetEnvironment, 'UAT') }}:
+  - group: 'REPLACE_WITH_UAT_VARIABLE_GROUP'
+  - name: apimServiceConnection
+    value: 'REPLACE_WITH_UAT_SERVICE_CONNECTION'
+  - name: apimDeploymentEnvironment
+    value: 'apim-shared-policies-uat'
+
+- ${{ if eq(parameters.targetEnvironment, 'PROD') }}:
+  - group: 'REPLACE_WITH_PROD_VARIABLE_GROUP'
+  - name: apimServiceConnection
+    value: 'REPLACE_WITH_PROD_SERVICE_CONNECTION'
+  - name: apimDeploymentEnvironment
+    value: 'apim-shared-policies-prod'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: ReleaseSharedPolicies
+  displayName: 'Release shared policies to ${{ parameters.targetEnvironment }}'
+  jobs:
+  - deployment: DeploySharedPolicies
+    displayName: 'Deploy fragments, then global policy'
+    environment: ${{ variables.apimDeploymentEnvironment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            clean: true
+
+          # Explicitly consume the run chosen under Run Pipeline > Resources.
+          # A pipeline-resource Build Artifact downloads to:
+          # $(Pipeline.Workspace)/sharedPoliciesBuild/apim-shared-policies/
+          - download: sharedPoliciesBuild
+            artifact: 'apim-shared-policies'
+            displayName: 'Download selected versioned Build Artifact'
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $root = '$(Pipeline.Workspace)/sharedPoliciesBuild/apim-shared-policies'
+              Write-Host 'Selected Build run: $(resources.pipeline.sharedPoliciesBuild.runName)'
+              Write-Host 'Selected Build run ID: $(resources.pipeline.sharedPoliciesBuild.runID)'
+              Write-Host 'Selected Build branch: $(resources.pipeline.sharedPoliciesBuild.sourceBranch)'
+              Write-Host 'Target environment: ${{ parameters.targetEnvironment }}'
+              foreach ($required in @(
+                (Join-Path $root 'fragments/policy fragments'),
+                (Join-Path $root 'global/policy.xml')
+              )) {
+                if (-not (Test-Path -LiteralPath $required)) {
+                  throw "Expected Build Artifact path missing: $required"
+                }
+              }
+              Write-Host 'Artifact layout verified.'
+            displayName: 'Confirm selected build and artifact layout'
+
+          # SAME deployment script and parameters as your working Dev pipeline.
+          # Fragment Publisher executes first; a failure prevents Global execution.
+          - task: AzureCLI@2
+            displayName: 'Publish policy fragments (APIOps v7.0.2)'
+            inputs:
+              azureSubscription: ${{ variables.apimServiceConnection }}
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                & "$(Build.SourcesDirectory)/scripts/deploy-shared-policies.ps1" `
+                  -Stage Fragments `
+                  -ArtifactsRoot "$(Pipeline.Workspace)/sharedPoliciesBuild/apim-shared-policies" `
+                  -TargetSubscriptionId "$(targetSubscriptionId)" `
+                  -TargetResourceGroup "$(targetResourceGroup)" `
+                  -TargetApimName "$(targetApimName)"
+
+          - task: AzureCLI@2
+            displayName: 'Publish global policy (APIOps v7.0.2)'
+            inputs:
+              azureSubscription: ${{ variables.apimServiceConnection }}
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                & "$(Build.SourcesDirectory)/scripts/deploy-shared-policies.ps1" `
+                  -Stage Global `
+                  -ArtifactsRoot "$(Pipeline.Workspace)/sharedPoliciesBuild/apim-shared-policies" `
+                  -TargetSubscriptionId "$(targetSubscriptionId)" `
+                  -TargetResourceGroup "$(targetResourceGroup)" `
+                  -TargetApimName "$(targetApimName)"
