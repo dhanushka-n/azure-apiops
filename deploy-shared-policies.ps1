@@ -158,3 +158,106 @@ function Assert-FragmentDeployed {
         throw "Deployed fragment '$Name' has invalid XML: $($_.Exception.Message)"
     }
     if ([string]::IsNullOrWhiteSpace([string]$actual.properties.description)) {
+        throw "Fragment '$Name' has no description."
+    }
+    Write-Host "$Prefix fragment exists with valid XML and description: $Name"
+}
+
+# Ensure the previously deployed fragments are readable before deploying global policy.
+# The global policy is not required to reference any particular fragment.
+if ($Stage -eq 'Global') {
+    foreach ($name in $fragments) {
+        Assert-FragmentDeployed -Name $name -Prefix 'PREFLIGHT VERIFIED'
+    }
+}
+
+$assetName = if ($IsWindows) { 'publisher-win-x64.zip' }
+             elseif ($IsLinux) { 'publisher-linux-x64.zip' }
+             else { throw 'Use a Windows or Linux x64 PowerShell 7 Azure DevOps agent.' }
+$exeName = if ($IsWindows) { 'publisher.exe' } else { 'publisher' }
+
+$tempBase = if (-not [string]::IsNullOrWhiteSpace($env:AGENT_TEMPDIRECTORY)) {
+    $env:AGENT_TEMPDIRECTORY
+} else {
+    [System.IO.Path]::GetTempPath()
+}
+$workDir = Join-Path $tempBase ("apim-publisher-" + [guid]::NewGuid().ToString('N'))
+[void][System.IO.Directory]::CreateDirectory($workDir)
+
+try {
+    $downloadUri = "https://github.com/Azure/apiops/releases/download/$PublisherVersion/$assetName"
+    $zipPath = Join-Path $workDir $assetName
+    $extractDir = Join-Path $workDir 'publisher'
+    Write-Host "Downloading APIOps Publisher $PublisherVersion for $Stage..."
+    Invoke-WebRequest -Uri $downloadUri -OutFile $zipPath
+
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedPublisherSha256)) {
+        $actualHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+        if ($actualHash -ine $ExpectedPublisherSha256) {
+            throw "Publisher ZIP SHA256 does not match the expected value."
+        }
+    }
+
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+    $exePath = Join-Path $extractDir $exeName
+    if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+        throw "Publisher binary missing from downloaded archive: $exePath"
+    }
+    if ($IsLinux) {
+        & chmod +x $exePath
+        if ($LASTEXITCODE -ne 0) { throw 'Could not make Publisher executable.' }
+    }
+
+    $token = (& az account get-access-token --resource 'https://management.azure.com/' --query accessToken -o tsv)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($token -join ''))) {
+        throw 'Could not acquire an ARM token from the Azure CLI login.'
+    }
+
+    $env:AZURE_SUBSCRIPTION_ID = $TargetSubscriptionId
+    $env:AZURE_RESOURCE_GROUP_NAME = $TargetResourceGroup
+    $env:API_MANAGEMENT_SERVICE_NAME = $TargetApimName
+    $env:API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH = $publishRoot
+    $env:ARM_API_VERSION = $ArmApiVersion
+    $env:AZURE_BEARER_TOKEN = ($token -join '').Trim()
+    Remove-Item Env:COMMIT_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:CONFIGURATION_YAML_PATH -ErrorAction SilentlyContinue
+
+    Write-Host "PUBLISH Stage=$Stage; Target=$TargetApimName; ArtifactRoot=$publishRoot"
+    Write-Host "Publisher input files:"
+    Get-ChildItem -LiteralPath $publishRoot -Recurse -File | ForEach-Object {
+        Write-Host ('  ' + [System.IO.Path]::GetRelativePath($publishRoot, $_.FullName))
+    }
+    & $exePath
+    if ($LASTEXITCODE -ne 0) {
+        throw "APIOps Publisher $PublisherVersion failed for $Stage (exit code $LASTEXITCODE)."
+    }
+    Write-Host "Publisher completed: $Stage"
+}
+finally {
+    Remove-Item Env:AZURE_BEARER_TOKEN -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $workDir) {
+        Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Verify that deployment produced readable resources and well-formed XML.
+# No strict XML content comparison or global include-fragment checks.
+if ($Stage -eq 'Fragments') {
+    foreach ($name in $fragments) {
+        Assert-FragmentDeployed -Name $name -Prefix 'VERIFIED'
+    }
+}
+else {
+    $resource = Get-ApimResource -ResourcePath 'policies/policy'
+    if ([string]::IsNullOrWhiteSpace([string]$resource.properties.value)) {
+        throw 'Global policy not readable after Publisher deployment.'
+    }
+    try {
+        $null = Assert-Xml -XmlText ([string]$resource.properties.value) -ExpectedRoot 'policies'
+    }
+    catch {
+        throw "Deployed global policy has invalid XML: $($_.Exception.Message)"
+    }
+    Write-Host 'VERIFIED global policy resource exists with well-formed XML.'
+}
+Write-Host "SUCCESS: APIOps Publisher $PublisherVersion deployed and verified $Stage."
