@@ -84,15 +84,27 @@ function Assert-OnlyFiles {
 
 # Hard stop if the wrong artifact root is passed to Publisher.
 if ($Stage -eq 'Fragments') {
-    $expected = @($fragments | ForEach-Object { "policyFragments/$_/policyFragmentInformation.json" })
+    # Publisher v7.0.2 uses "policy fragments" (with a space) and separate XML files.
+    $expected = @($fragments | ForEach-Object {
+        "policy fragments/$_/policyFragmentInformation.json"
+        "policy fragments/$_/policy.xml"
+    })
     Assert-OnlyFiles -Root $publishRoot -AllowedFiles $expected
     foreach ($name in $fragments) {
-        $jsonPath = Join-Path (Join-Path (Join-Path $publishRoot 'policyFragments') $name) 'policyFragmentInformation.json'
+        $fragmentFolder = Join-Path (Join-Path $publishRoot 'policy fragments') $name
+        $jsonPath = Join-Path $fragmentFolder 'policyFragmentInformation.json'
+        $xmlPath = Join-Path $fragmentFolder 'policy.xml'
         $item = Get-Content -LiteralPath $jsonPath -Raw -Encoding utf8 | ConvertFrom-Json
-        if ($item.properties.format -cne 'rawxml' -or [string]::IsNullOrWhiteSpace($item.properties.value)) {
-            throw "Invalid APIOps fragment artifact: $jsonPath"
+        if ([string]::IsNullOrWhiteSpace([string]$item.properties.description)) {
+            throw "Missing APIOps fragment description: $jsonPath"
         }
-        $null = Assert-Xml -XmlText $item.properties.value -ExpectedRoot 'fragment'
+        # Metadata must not contain policy XML in this v7.0.2 artifact format.
+        if ($null -ne $item.properties.PSObject.Properties['value'] -or
+            $null -ne $item.properties.PSObject.Properties['format']) {
+            throw "Unexpected inline XML in fragment metadata: $jsonPath"
+        }
+        $fragmentXml = Get-Content -LiteralPath $xmlPath -Raw -Encoding utf8
+        $null = Assert-Xml -XmlText $fragmentXml -ExpectedRoot 'fragment'
     }
 }
 else {
@@ -134,15 +146,42 @@ function Get-ApimResource {
     return (($result -join "`n") | ConvertFrom-Json)
 }
 
-# Do not replace global policy until ALL fragment resources are visible.
+# Compare the actual deployed content with the expected source, not merely existence.
+function Assert-FragmentMatchesArtifact {
+    param([string] $Name, [string] $Prefix)
+    $fragmentFolder = Join-Path (Join-Path (Join-Path $ArtifactsRoot 'fragments') 'policy fragments') $Name
+    $metadataPath = Join-Path $fragmentFolder 'policyFragmentInformation.json'
+    $expectedPolicyPath = Join-Path $fragmentFolder 'policy.xml'
+    if (-not (Test-Path -LiteralPath $metadataPath) -or
+        -not (Test-Path -LiteralPath $expectedPolicyPath)) {
+        throw "Expected packaged fragment files are missing for '$Name'."
+    }
+    $expectedMetadata = Get-Content -LiteralPath $metadataPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $expectedPolicy = Get-Content -LiteralPath $expectedPolicyPath -Raw -Encoding utf8
+    $actual = Get-ApimResource -ResourcePath "policyFragments/$Name"
+    if ([string]::IsNullOrWhiteSpace([string]$actual.properties.value)) {
+        throw "Fragment '$Name' has no deployed XML."
+    }
+    try {
+        $expectedDoc = Assert-Xml -XmlText $expectedPolicy -ExpectedRoot 'fragment'
+        $actualDoc = Assert-Xml -XmlText ([string]$actual.properties.value) -ExpectedRoot 'fragment'
+    }
+    catch {
+        throw "Invalid deployed XML for fragment '$Name': $($_.Exception.Message)"
+    }
+    if ($expectedDoc.OuterXml -cne $actualDoc.OuterXml) {
+        throw "Deployed XML for fragment '$Name' does not match the artifact. Publisher may not have applied the update."
+    }
+    if ([string]$actual.properties.description -cne [string]$expectedMetadata.properties.description) {
+        throw "Deployed description for fragment '$Name' does not match the artifact."
+    }
+    Write-Host "$Prefix fragment content and description match: $Name"
+}
+
+# Do not replace global policy until ALL fragment resources match current build artifacts.
 if ($Stage -eq 'Global') {
     foreach ($name in $fragments) {
-        $existing = Get-ApimResource -ResourcePath "policyFragments/$name"
-        if ([string]::IsNullOrWhiteSpace([string]$existing.properties.value)) {
-            throw "Required fragment '$name' is missing or empty in Dev APIM."
-        }
-        $null = Assert-Xml -XmlText ([string]$existing.properties.value) -ExpectedRoot 'fragment'
-        Write-Host "PREFLIGHT fragment exists: $name"
+        Assert-FragmentMatchesArtifact -Name $name -Prefix 'PREFLIGHT VERIFIED'
     }
 }
 
@@ -198,6 +237,10 @@ try {
     Remove-Item Env:CONFIGURATION_YAML_PATH -ErrorAction SilentlyContinue
 
     Write-Host "PUBLISH Stage=$Stage; Target=$TargetApimName; ArtifactRoot=$publishRoot"
+    Write-Host "Publisher input files:"
+    Get-ChildItem -LiteralPath $publishRoot -Recurse -File | ForEach-Object {
+        Write-Host ('  ' + [System.IO.Path]::GetRelativePath($publishRoot, $_.FullName))
+    }
     & $exePath
     if ($LASTEXITCODE -ne 0) {
         throw "APIOps Publisher $PublisherVersion failed for $Stage (exit code $LASTEXITCODE)."
@@ -211,15 +254,10 @@ finally {
     }
 }
 
-# Verify each resource via read-only GET after Publisher succeeds.
+# Verify actual resource contents, not just existence, after Publisher succeeds.
 if ($Stage -eq 'Fragments') {
     foreach ($name in $fragments) {
-        $resource = Get-ApimResource -ResourcePath "policyFragments/$name"
-        if ([string]::IsNullOrWhiteSpace([string]$resource.properties.value)) {
-            throw "Publisher exited successfully, but fragment '$name' is missing or empty."
-        }
-        $null = Assert-Xml -XmlText ([string]$resource.properties.value) -ExpectedRoot 'fragment'
-        Write-Host "VERIFIED fragment resource: $name"
+        Assert-FragmentMatchesArtifact -Name $name -Prefix 'VERIFIED'
     }
 }
 else {
