@@ -138,12 +138,61 @@ if (-not $serviceId.Equals($expectedServiceId, [StringComparison]::OrdinalIgnore
 # Read-only ARM verification. These calls do NOT create/update resources.
 function Get-ApimResource {
     param([string] $ResourcePath)
-    $uri = "https://management.azure.com$serviceId/$ResourcePath" + "?api-version=$ArmApiVersion&format=rawxml"
+    $uri = "https://management.azure.com$serviceId/$ResourcePath" + "?api-version=$ArmApiVersion&format=xml"
     $result = (& az rest --method get --url $uri --output json)
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($result -join ''))) {
         throw "Unable to read APIM resource: $ResourcePath"
     }
     return (($result -join "`n") | ConvertFrom-Json)
+}
+
+# Compare XML structure and values instead of serialized OuterXml. Azure APIM may
+# round-trip XML with different attribute ordering, indentation or empty-tag style.
+# This is intentionally strict on element order, names, attribute values and text.
+function Assert-XmlEquivalent {
+    param(
+        [System.Xml.XmlNode] $Expected,
+        [System.Xml.XmlNode] $Actual,
+        [string] $Location = '/fragment'
+    )
+
+    if ($Expected.NodeType -ne $Actual.NodeType -or
+        $Expected.LocalName -cne $Actual.LocalName -or
+        $Expected.NamespaceURI -cne $Actual.NamespaceURI) {
+        throw "XML structural mismatch at $Location (node name or type differs)."
+    }
+
+    if ($Expected.NodeType -eq [System.Xml.XmlNodeType]::Element) {
+        $expectedAttrs = @($Expected.Attributes | Where-Object { $_.NamespaceURI -ne 'http://www.w3.org/2000/xmlns/' })
+        $actualAttrs = @($Actual.Attributes | Where-Object { $_.NamespaceURI -ne 'http://www.w3.org/2000/xmlns/' })
+        if ($expectedAttrs.Count -ne $actualAttrs.Count) {
+            throw "XML attribute count mismatch at $Location."
+        }
+        foreach ($attr in $expectedAttrs) {
+            $other = $Actual.Attributes.GetNamedItem($attr.LocalName, $attr.NamespaceURI)
+            if ($null -eq $other) {
+                throw "Missing deployed XML attribute '$($attr.Name)' at $Location."
+            }
+            if ($attr.Value -cne $other.Value) {
+                throw "Deployed XML attribute value differs at $Location/@$($attr.Name)."
+            }
+        }
+
+        # Document loading already discards insignificant whitespace; comments
+        # have no effect on policy execution and are intentionally ignored.
+        $expectedChildren = @($Expected.ChildNodes | Where-Object { $_.NodeType -ne [System.Xml.XmlNodeType]::Comment })
+        $actualChildren = @($Actual.ChildNodes | Where-Object { $_.NodeType -ne [System.Xml.XmlNodeType]::Comment })
+        if ($expectedChildren.Count -ne $actualChildren.Count) {
+            throw "XML child-element/text count mismatch at $Location (expected $($expectedChildren.Count), deployed $($actualChildren.Count))."
+        }
+        for ($i = 0; $i -lt $expectedChildren.Count; $i++) {
+            $child = $expectedChildren[$i]
+            Assert-XmlEquivalent -Expected $child -Actual $actualChildren[$i] -Location "$Location/$($child.LocalName)[$i]"
+        }
+    }
+    elseif ($Expected.Value -cne $Actual.Value) {
+        throw "Deployed XML text/value differs at $Location."
+    }
 }
 
 # Compare the actual deployed content with the expected source, not merely existence.
@@ -169,8 +218,11 @@ function Assert-FragmentMatchesArtifact {
     catch {
         throw "Invalid deployed XML for fragment '$Name': $($_.Exception.Message)"
     }
-    if ($expectedDoc.OuterXml -cne $actualDoc.OuterXml) {
-        throw "Deployed XML for fragment '$Name' does not match the artifact. Publisher may not have applied the update."
+    try {
+        Assert-XmlEquivalent -Expected $expectedDoc.DocumentElement -Actual $actualDoc.DocumentElement -Location "/fragment/$Name"
+    }
+    catch {
+        throw "Deployed XML mismatch for fragment '$Name': $($_.Exception.Message)"
     }
     if ([string]$actual.properties.description -cne [string]$expectedMetadata.properties.description) {
         throw "Deployed description for fragment '$Name' does not match the artifact."
