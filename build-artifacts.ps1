@@ -7,8 +7,9 @@
       global/policy.xml
       policyFragments/<fragment-id>/policy.xml
 
-    Output layout:
-      <OutputRoot>/fragments/policyFragments/<fragment-id>/policyFragmentInformation.json
+    Output layout (APIOps Publisher v7.0.2):
+      <OutputRoot>/fragments/policy fragments/<fragment-id>/policyFragmentInformation.json
+      <OutputRoot>/fragments/policy fragments/<fragment-id>/policy.xml
       <OutputRoot>/global/policy.xml
 
     This script NEVER calls Azure or creates APIM resources.
@@ -125,18 +126,20 @@ foreach ($dir in @($fragmentsOutput, $globalOutput)) {
 }
 
 foreach ($name in $fragmentDescriptions.Keys) {
-    $destination = Join-Path (Join-Path $fragmentsOutput 'policyFragments') $name
+    # APIOps v7.0.2 uses the literal directory "policy fragments" (with a space).
+    # Metadata and the policy XML are separate artifacts in this release.
+    $destination = Join-Path (Join-Path $fragmentsOutput 'policy fragments') $name
     [void][System.IO.Directory]::CreateDirectory($destination)
     $json = [ordered]@{
         properties = [ordered]@{
             description = $fragmentDescriptions[$name]
-            format      = 'rawxml'
-            value       = $xmlByFragment[$name]
         }
     } | ConvertTo-Json -Depth 8
     $jsonPath = Join-Path $destination 'policyFragmentInformation.json'
+    $policyPath = Join-Path $destination 'policy.xml'
     [System.IO.File]::WriteAllText($jsonPath, $json, $utf8)
-    Write-Host "PACKAGED fragment: $name"
+    [System.IO.File]::WriteAllText($policyPath, $xmlByFragment[$name], $utf8)
+    Write-Host "PACKAGED fragment (metadata + policy XML): $name"
 }
 
 [System.IO.File]::WriteAllText((Join-Path $globalOutput 'policy.xml'), $globalXml, $utf8)
