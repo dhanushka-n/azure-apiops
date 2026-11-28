@@ -1,18 +1,21 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-    Builds two independent APIOps Publisher artifact roots.
+    Builds isolated APIOps Publisher v7.0.2 artifact roots from repository XML/JSON.
 .DESCRIPTION
-    Source layout:
-      global/policy.xml
+    Repository input:
       policyFragments/<fragment-id>/policy.xml
+      policyFragments/<fragment-id>/policyFragmentInformation.json
+      global/policy.xml
 
-    Output layout (APIOps Publisher v7.0.2):
-      <OutputRoot>/fragments/policy fragments/<fragment-id>/policyFragmentInformation.json
+    Artifact output:
       <OutputRoot>/fragments/policy fragments/<fragment-id>/policy.xml
+      <OutputRoot>/fragments/policy fragments/<fragment-id>/policyFragmentInformation.json
       <OutputRoot>/global/policy.xml
 
-    This script NEVER calls Azure or creates APIM resources.
+    Every immediate folder under policyFragments is discovered automatically.
+    The folder name becomes the APIM fragment ID. JSON supplies the description.
+    No Azure resources are created or modified by this script.
 .EXAMPLE
     ./scripts/build-artifacts.ps1 -RepoRoot . -OutputRoot ./artifacts
 #>
@@ -37,23 +40,36 @@ $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 
 $sourceFragments = Join-Path $RepoRoot 'policyFragments'
 $sourceGlobal = Join-Path $RepoRoot 'global'
+$globalSource = Join-Path $sourceGlobal 'policy.xml'
 
-# Safeguard: never clean folders containing source XML.
+if (-not (Test-Path -LiteralPath $sourceFragments -PathType Container)) {
+    throw "Missing source policyFragments folder: $sourceFragments"
+}
+
+# Only generated directories may be deleted. Never clean the Git checkout,
+# any ancestor of it, or a folder underneath sourceFragments/global.
+$comparison = if ($IsWindows) {
+    [System.StringComparison]::OrdinalIgnoreCase
+} else {
+    [System.StringComparison]::Ordinal
+}
 $sep = [System.IO.Path]::DirectorySeparatorChar
+$out = [System.IO.Path]::TrimEndingDirectorySeparator($OutputRoot)
+$rootPath = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetPathRoot($OutputRoot))
+if ($out.Equals($rootPath, $comparison)) {
+    throw "Unsafe OutputRoot '$OutputRoot': filesystem root is not permitted."
+}
 foreach ($protected in @($RepoRoot, $sourceFragments, $sourceGlobal)) {
-    $p = [System.IO.Path]::GetFullPath($protected).TrimEnd([char[]]@('/','\'))
-    $o = $OutputRoot.TrimEnd([char[]]@('/','\'))
-    if ($o.Equals($p, [StringComparison]::OrdinalIgnoreCase) -or
-        $p.StartsWith($o + $sep, [StringComparison]::OrdinalIgnoreCase) -or
-        $o.StartsWith($p + $sep, [StringComparison]::OrdinalIgnoreCase) -and
-        -not $p.Equals($RepoRoot.TrimEnd([char[]]@('/','\')), [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Unsafe OutputRoot '$OutputRoot': overlaps source folder '$p'."
+    $p = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($protected))
+    if ($out.Equals($p, $comparison) -or
+        $out.StartsWith($p + $sep, $comparison) -and (-not $p.Equals([System.IO.Path]::TrimEndingDirectorySeparator($RepoRoot), $comparison)) -or
+        $p.StartsWith($out + $sep, $comparison)) {
+        throw "Unsafe OutputRoot '$OutputRoot': overlaps protected path '$protected'."
     }
 }
 
 function Read-ValidatedXml {
     param([string] $File, [string] $ExpectedRoot)
-
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
         throw "Required XML file not found: $File"
     }
@@ -64,57 +80,89 @@ function Read-ValidatedXml {
     try {
         $doc = [System.Xml.XmlDocument]::new()
         $doc.XmlResolver = $null
-        $doc.PreserveWhitespace = $true
         $doc.Load($reader)
     }
-    finally {
-        $reader.Dispose()
-    }
+    finally { $reader.Dispose() }
     if ($null -eq $doc.DocumentElement -or $doc.DocumentElement.Name -cne $ExpectedRoot) {
-        throw "Invalid XML root in $File; expected <$ExpectedRoot>."
+        throw "Invalid XML root in '$File'. Expected <$ExpectedRoot>."
     }
     return $doc
 }
 
-$fragmentDescriptions = [ordered]@{
-    'apim-log-incoming-requests' = 'Shared incoming request logging'
-    'apim-log-policy-error'   = 'Shared global error logging'
-    'apim-log-custom-rejection' = 'Shared API and operation custom rejection logging'
-}
-
-# Validate everything before replacing any existing generated artifacts.
-$globalSource = Join-Path $sourceGlobal 'policy.xml'
-$globalDoc = Read-ValidatedXml -File $globalSource -ExpectedRoot 'policies'
-foreach ($section in @('inbound','backend','outbound','on-error')) {
-    if ($null -eq $globalDoc.DocumentElement.SelectSingleNode($section)) {
-        throw "Global policy missing <$section>: $globalSource"
+function Read-FragmentDescription {
+    param([string] $JsonPath)
+    if (-not (Test-Path -LiteralPath $JsonPath -PathType Leaf)) {
+        throw "Missing fragment metadata JSON: $JsonPath"
     }
-}
-if ($null -eq $globalDoc.DocumentElement.SelectSingleNode("inbound/include-fragment[@fragment-id='apim-log-incoming-requests']")) {
-    throw 'Global inbound policy must reference apim-log-incoming-requests.'
-}
-if ($null -eq $globalDoc.DocumentElement.SelectSingleNode("on-error/include-fragment[@fragment-id='apim-log-policy-error']")) {
-    throw 'Global on-error policy must reference apim-log-policy-error.'
-}
-if ($null -eq $globalDoc.DocumentElement.SelectSingleNode('inbound/cors')) {
-    throw 'Global inbound CORS policy was not found. Preserve the existing CORS configuration.'
+    try {
+        $metadata = Get-Content -LiteralPath $JsonPath -Raw -Encoding utf8 | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "Invalid fragment metadata JSON '$JsonPath': $($_.Exception.Message)"
+    }
+    if ($null -eq $metadata -or $null -eq $metadata.PSObject.Properties['properties']) {
+        throw "Fragment metadata must contain a 'properties' object: $JsonPath"
+    }
+    $props = $metadata.properties
+    if ($null -eq $props -or $null -eq $props.PSObject.Properties['description'] -or
+        $props.description -isnot [string] -or
+        [string]::IsNullOrWhiteSpace($props.description)) {
+        throw "Fragment metadata must contain a non-empty string properties.description: $JsonPath"
+    }
+    if ($props.description.Length -gt 1000) {
+        throw "Fragment description must be at most 1000 characters: $JsonPath"
+    }
+    if ($null -ne $props.PSObject.Properties['value'] -or
+        $null -ne $props.PSObject.Properties['format']) {
+        throw "Do not embed format/value in source metadata; use the separate policy.xml: $JsonPath"
+    }
+    return [string]$props.description
 }
 
+# Validate all source files before clearing any existing generated output.
+$null = Read-ValidatedXml -File $globalSource -ExpectedRoot 'policies'
 $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
-$xmlByFragment = @{}
-foreach ($name in $fragmentDescriptions.Keys) {
-    $xmlPath = Join-Path (Join-Path $sourceFragments $name) 'policy.xml'
-    $doc = Read-ValidatedXml -File $xmlPath -ExpectedRoot 'fragment'
-    if ($doc.DocumentElement.SelectNodes('*').Count -eq 0) {
-        throw "Fragment '$name' is empty: $xmlPath"
-    }
-    $forbidden = $doc.SelectNodes('//*[local-name()="base" or local-name()="inbound" or local-name()="backend" or local-name()="outbound" or local-name()="on-error" or local-name()="include-fragment"]')
-    if ($forbidden.Count -gt 0) {
-        throw "Fragment '$name' contains unsupported <base>, policy-section or nested fragment elements."
-    }
-    $xmlByFragment[$name] = [System.IO.File]::ReadAllText($xmlPath, $utf8)
+
+$dirs = @(Get-ChildItem -LiteralPath $sourceFragments -Directory | Sort-Object Name)
+if ($dirs.Count -eq 0) {
+    throw "No fragment folders found directly under '$sourceFragments'."
 }
-$globalXml = [System.IO.File]::ReadAllText($globalSource, $utf8)
+
+$seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$validated = @(
+    foreach ($dir in $dirs) {
+        $name = $dir.Name
+        if ($name.Length -gt 80 -or
+            $name -cnotmatch '^[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?$') {
+            throw "Invalid APIM fragment ID '$name'. Use 1-80 letters, digits, underscores or internal hyphens."
+        }
+        if (-not $seen.Add($name)) {
+            throw "Duplicate APIM fragment ID (case-insensitive): '$name'."
+        }
+
+        $xmlPath = Join-Path $dir.FullName 'policy.xml'
+        $jsonPath = Join-Path $dir.FullName 'policyFragmentInformation.json'
+        $doc = Read-ValidatedXml -File $xmlPath -ExpectedRoot 'fragment'
+        if ($doc.DocumentElement.SelectNodes('*').Count -eq 0) {
+            throw "Fragment '$name' has no policy statements."
+        }
+        # APIM prohibits section wrappers, <base> and nested includes within fragments.
+        $forbidden = $doc.SelectNodes('//*[local-name()="base" or local-name()="inbound" or local-name()="backend" or local-name()="outbound" or local-name()="on-error" or local-name()="include-fragment"]')
+        if ($forbidden.Count -gt 0) {
+            throw "Fragment '$name' contains unsupported section, base, or include-fragment elements."
+        }
+        $xmlContent = [System.IO.File]::ReadAllText($xmlPath, $utf8)
+        if ($utf8.GetByteCount($xmlContent) -gt 512KB) {
+            throw "Fragment '$name' exceeds the APIM 512 KB fragment size limit."
+        }
+        $description = Read-FragmentDescription -JsonPath $jsonPath
+        [pscustomobject]@{
+            Name = $name
+            PolicyXml = $xmlContent
+            Description = $description
+        }
+    }
+)
 
 $fragmentsOutput = Join-Path $OutputRoot 'fragments'
 $globalOutput = Join-Path $OutputRoot 'global'
@@ -125,23 +173,25 @@ foreach ($dir in @($fragmentsOutput, $globalOutput)) {
     [void][System.IO.Directory]::CreateDirectory($dir)
 }
 
-foreach ($name in $fragmentDescriptions.Keys) {
-    # APIOps v7.0.2 uses the literal directory "policy fragments" (with a space).
-    # Metadata and the policy XML are separate artifacts in this release.
-    $destination = Join-Path (Join-Path $fragmentsOutput 'policy fragments') $name
+foreach ($item in $validated) {
+    # The literal space in 'policy fragments' is required by APIOps v7.0.2.
+    $destination = Join-Path (Join-Path $fragmentsOutput 'policy fragments') $item.Name
     [void][System.IO.Directory]::CreateDirectory($destination)
-    $json = [ordered]@{
+
+    $metadata = [ordered]@{
         properties = [ordered]@{
-            description = $fragmentDescriptions[$name]
+            description = $item.Description
         }
     } | ConvertTo-Json -Depth 8
-    $jsonPath = Join-Path $destination 'policyFragmentInformation.json'
-    $policyPath = Join-Path $destination 'policy.xml'
-    [System.IO.File]::WriteAllText($jsonPath, $json, $utf8)
-    [System.IO.File]::WriteAllText($policyPath, $xmlByFragment[$name], $utf8)
-    Write-Host "PACKAGED fragment (metadata + policy XML): $name"
+    [System.IO.File]::WriteAllText((Join-Path $destination 'policyFragmentInformation.json'), $metadata, $utf8)
+    [System.IO.File]::WriteAllText((Join-Path $destination 'policy.xml'), $item.PolicyXml, $utf8)
+    Write-Host "PACKAGED fragment: $($item.Name)"
 }
 
-[System.IO.File]::WriteAllText((Join-Path $globalOutput 'policy.xml'), $globalXml, $utf8)
+[System.IO.File]::WriteAllText(
+    (Join-Path $globalOutput 'policy.xml'),
+    [System.IO.File]::ReadAllText($globalSource, $utf8),
+    $utf8
+)
 Write-Host "PACKAGED global policy."
-Write-Host "SUCCESS: Two isolated artifact roots created under $OutputRoot"
+Write-Host "SUCCESS: $($validated.Count) fragments and global policy packaged under $OutputRoot"
