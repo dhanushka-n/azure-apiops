@@ -43,7 +43,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$fragments = @('apim-log-incoming-requests', 'apim-log-policy-error', 'apim-log-custom-rejection')
 $ArtifactsRoot = [System.IO.Path]::GetFullPath($ArtifactsRoot)
 $stageFolder = if ($Stage -eq 'Fragments') { 'fragments' } else { 'global' }
 $publishRoot = Join-Path $ArtifactsRoot $stageFolder
@@ -51,6 +50,29 @@ $publishRoot = Join-Path $ArtifactsRoot $stageFolder
 if (-not (Test-Path -LiteralPath $publishRoot -PathType Container)) {
     throw "Missing $Stage artifact root: $publishRoot"
 }
+
+# Discover fragment IDs from the SELECTED Build Artifact, never from the Git
+# checkout of the Release pipeline. This preserves artifact-version fidelity.
+$artifactFragmentRoot = Join-Path (Join-Path $ArtifactsRoot 'fragments') 'policy fragments'
+if (-not (Test-Path -LiteralPath $artifactFragmentRoot -PathType Container)) {
+    throw "Missing packaged fragments: $artifactFragmentRoot"
+}
+$fragmentDirs = @(Get-ChildItem -LiteralPath $artifactFragmentRoot -Directory | Sort-Object Name)
+if ($fragmentDirs.Count -eq 0) {
+    throw "Selected artifact contains no policy fragment folders."
+}
+$fragments = @($fragmentDirs | ForEach-Object { $_.Name })
+$seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($name in $fragments) {
+    if ($name.Length -gt 80 -or
+        $name -cnotmatch '^[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?$') {
+        throw "Invalid APIM fragment ID in selected artifact: '$name'."
+    }
+    if (-not $seen.Add($name)) {
+        throw "Duplicate APIM fragment ID in selected artifact: '$name'."
+    }
+}
+Write-Host "Selected artifact contains $($fragments.Count) fragments: $($fragments -join ', ')"
 
 function Assert-Xml {
     param([string] $XmlText, [string] $ExpectedRoot)
@@ -133,8 +155,9 @@ if (-not $serviceId.Equals($expectedServiceId, [StringComparison]::OrdinalIgnore
 # Read-only ARM verification. These calls do NOT create/update resources.
 function Get-ApimResource {
     param([string] $ResourcePath)
-    $uri = "https://management.azure.com$serviceId/$ResourcePath" + "?api-version=$ArmApiVersion&format=xml"
-    $result = (& az rest --method get --url $uri --output json)
+    # Keep the GET response in ARM's JSON contract (avoid format=xml here).
+    $uri = "https://management.azure.com$serviceId/$ResourcePath" + "?api-version=$ArmApiVersion"
+    $result = (& az rest --method get --url $uri --headers 'Accept=application/json' --output json)
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($result -join ''))) {
         throw "Unable to read APIM resource: $ResourcePath"
     }
